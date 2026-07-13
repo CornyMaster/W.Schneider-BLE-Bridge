@@ -24,6 +24,12 @@ The reference build uses an **IoTorero Mini Relay RS01C3** (IoTorero is the newe
 brand name of Athom). It is a mains-powered, ESPHome-friendly ESP32-C3 module —
 convenient when 230 V is already available near the cabinet.
 
+Athom lists this board as **"Bluetooth Proxy Supported"** and it runs as an
+ESPHome Bluetooth Proxy by default. This project instead uses it as an active
+BLE client (the cabinet controller), but the vendor confirmation is useful if
+you ever want the alternative "Home Assistant drives the BLE via a proxy"
+architecture — see the proxy notes in the mirror-cabinet project documentation.
+
 | Property | Value |
 |----------|-------|
 | SoC | ESP32-C3 (single-core RISC-V, BLE 5) |
@@ -41,7 +47,7 @@ convenient when 230 V is already available near the cabinet.
 | GPIO3 | push button |
 | GPIO6 | relay |
 | GPIO7 | status LED |
-| GPIO20 | CSE7766 power monitor |
+| GPIO20 | power-monitoring IC (CSE7766 or HLW8032, depending on hardware revision) |
 
 This project **does not use the relay or the power monitor** — the board only
 serves as a continuously powered ESP32 for the BLE link. You therefore do not
