@@ -1,0 +1,13 @@
+# ESPHome secrets and build artifacts
+esphome/secrets.yaml
+esphome/.esphome/
+*.bin
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+Thumbs.db

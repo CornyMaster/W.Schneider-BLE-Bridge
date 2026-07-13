@@ -1,0 +1,223 @@
+# =============================================================================
+# W.Schneider "WSC LC10" BLE light controller — ESPHome protocol package
+# Include from a device configuration via `packages:`. The including file MUST
+# define these substitutions:  cabinet_mac, uuid_prefix, uuid_suffix.
+# Protocol reference: docs/protocol.md
+# =============================================================================
+
+# --- GATT characteristic UUIDs (derived from the parent's uuid_prefix/suffix) --
+# Each characteristic UUID is the vendor service UUID with its 4th byte replaced
+# by the selector shown below (c2 = color temp, c3 = brightness, ...).
+substitutions:
+  uuid_service:    "${uuid_prefix}c0${uuid_suffix}"
+  uuid_color_temp: "${uuid_prefix}c2${uuid_suffix}"
+  uuid_brightness: "${uuid_prefix}c3${uuid_suffix}"
+  uuid_rtc_date:   "${uuid_prefix}c4${uuid_suffix}"
+  uuid_rtc_time:   "${uuid_prefix}c5${uuid_suffix}"
+  uuid_lamp_mask:  "${uuid_prefix}c6${uuid_suffix}"
+  uuid_keepalive:  "${uuid_prefix}ce${uuid_suffix}"
+
+# --- BLE client connection to the cabinet --------------------------------------
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+ble_client:
+  - mac_address: ${cabinet_mac}
+    id: cabinet_ble
+    on_connect:
+      then:
+        - lambda: 'id(cabinet_connected).publish_state(true);'
+        - delay: 2s
+        - script.execute: send_init
+        - script.execute: apply_state
+    on_disconnect:
+      then:
+        - lambda: 'id(cabinet_connected).publish_state(false);'
+
+# --- Time source for the optional RTC sync handshake ---------------------------
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# --- Persisted target state (survives reboots) ---------------------------------
+globals:
+  - id: target_brightness_pct
+    type: float
+    restore_value: yes
+    initial_value: '80'
+  - id: target_color_temp_k
+    type: int
+    restore_value: yes
+    initial_value: '4000'
+
+# --- Write routines -------------------------------------------------------------
+script:
+  # Sync the controller's real-time clock (used only by its night-light
+  # scheduler). Skipped while Home Assistant has not provided a valid time.
+  - id: send_init
+    then:
+      - if:
+          condition:
+            lambda: 'return id(ha_time).now().is_valid();'
+          then:
+            - ble_client.ble_write:
+                id: cabinet_ble
+                service_uuid: ${uuid_service}
+                characteristic_uuid: ${uuid_rtc_date}
+                value: !lambda |-
+                  auto t = id(ha_time).now();
+                  return { (uint8_t)(t.year % 100), (uint8_t)t.month,
+                           (uint8_t)t.day_of_month };
+            - ble_client.ble_write:
+                id: cabinet_ble
+                service_uuid: ${uuid_service}
+                characteristic_uuid: ${uuid_rtc_time}
+                value: !lambda |-
+                  auto t = id(ha_time).now();
+                  return { (uint8_t)t.hour, (uint8_t)t.minute,
+                           (uint8_t)t.second };
+
+  # Push the desired state to the device: lamp mask first, then (only while
+  # at least one lamp is on) color temperature and brightness for both lamps.
+  - id: apply_state
+    then:
+      - ble_client.ble_write:
+          id: cabinet_ble
+          service_uuid: ${uuid_service}
+          characteristic_uuid: ${uuid_lamp_mask}
+          value: !lambda |-
+            uint8_t mask = (id(lamp_outer).state ? 0x01 : 0x00)
+                         | (id(lamp_inner).state ? 0x02 : 0x00);
+            return { (uint8_t)(mask ? 0x01 : 0x00), 0x00, mask, 0x00 };
+      - if:
+          condition:
+            lambda: 'return id(lamp_outer).state || id(lamp_inner).state;'
+          then:
+            - ble_client.ble_write:
+                id: cabinet_ble
+                service_uuid: ${uuid_service}
+                characteristic_uuid: ${uuid_color_temp}
+                value: !lambda |-
+                  int kelvin = id(target_color_temp_k);
+                  if (kelvin < 2000) kelvin = 2000;
+                  if (kelvin > 6500) kelvin = 6500;
+                  return { (uint8_t)(kelvin >> 8), (uint8_t)(kelvin & 0xFF),
+                           (uint8_t)(kelvin >> 8), (uint8_t)(kelvin & 0xFF) };
+            - ble_client.ble_write:
+                id: cabinet_ble
+                service_uuid: ${uuid_service}
+                characteristic_uuid: ${uuid_brightness}
+                value: !lambda |-
+                  int raw = (int)(id(target_brightness_pct) * 100.0f + 0.5f);
+                  if (raw < 100)   raw = 100;
+                  if (raw > 10000) raw = 10000;
+                  return { (uint8_t)(raw >> 8), (uint8_t)(raw & 0xFF),
+                           (uint8_t)(raw >> 8), (uint8_t)(raw & 0xFF) };
+
+# --- Entities exposed to Home Assistant ------------------------------------------
+binary_sensor:
+  - platform: template
+    name: "Cabinet connected"
+    id: cabinet_connected
+    device_class: connectivity
+
+button:
+  - platform: template
+    name: "Pair / send init"
+    id: cabinet_pair
+    entity_category: config
+    on_press:
+      - script.execute: send_init
+      - script.execute: apply_state
+
+switch:
+  - platform: template
+    name: "Outer lamp"
+    id: lamp_outer
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          if (id(target_brightness_pct) <= 0) id(target_brightness_pct) = 80;
+          id(lamp_outer).publish_state(true);
+      - script.execute: apply_state
+    turn_off_action:
+      - lambda: 'id(lamp_outer).publish_state(false);'
+      - script.execute: apply_state
+
+  - platform: template
+    name: "Inner lamp"
+    id: lamp_inner
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          if (id(target_brightness_pct) <= 0) id(target_brightness_pct) = 80;
+          id(lamp_inner).publish_state(true);
+      - script.execute: apply_state
+    turn_off_action:
+      - lambda: 'id(lamp_inner).publish_state(false);'
+      - script.execute: apply_state
+
+# --- Combined light (on/off + brightness + color temperature) --------------------
+# Presented to Home Assistant as one "Cabinet" light. The two template outputs
+# below are invisible in HA; their write_action stores the requested values into
+# the shared globals. gamma_correct is disabled so brightness maps linearly to
+# percent. Brightness and color temperature act on both lamps (hardware limit).
+output:
+  - platform: template
+    id: out_brightness
+    type: float
+    write_action:
+      - lambda: |-
+          // state is 0..1; keep the last non-zero level so turning the light off
+          // does not wipe the remembered brightness.
+          if (state > 0.0f) id(target_brightness_pct) = state * 100.0f;
+
+  - platform: template
+    id: out_color_temp
+    type: float
+    write_action:
+      - lambda: |-
+          // state is 0..1 on the mired scale (0 = cold 6500 K, 1 = warm 2000 K).
+          float min_mired = 1000000.0f / 6500.0f;
+          float max_mired = 1000000.0f / 2000.0f;
+          float mired = min_mired + state * (max_mired - min_mired);
+          id(target_color_temp_k) = (int)(1000000.0f / mired + 0.5f);
+
+light:
+  - platform: color_temperature
+    name: "Cabinet"
+    id: cabinet_light
+    brightness: out_brightness
+    color_temperature: out_color_temp
+    cold_white_color_temperature: 6500 K
+    warm_white_color_temperature: 2000 K
+    gamma_correct: 1.0
+    restore_mode: RESTORE_DEFAULT_OFF
+    # On/off is a master for the whole cabinet: it fans out to both lamp switches
+    # (which own the mask). Per-lamp on/off stays on those switches.
+    on_turn_on:
+      - switch.turn_on: lamp_outer
+      - switch.turn_on: lamp_inner
+    on_turn_off:
+      - switch.turn_off: lamp_outer
+      - switch.turn_off: lamp_inner
+    # Re-apply on any change, so brightness/color edits (light already on) are sent.
+    on_state:
+      - script.execute: apply_state
+
+# --- Keepalive (the controller drops idle connections after ~18 s) ---------------
+interval:
+  - interval: 3s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(cabinet_connected).state;'
+          then:
+            - ble_client.ble_write:
+                id: cabinet_ble
+                service_uuid: ${uuid_service}
+                characteristic_uuid: ${uuid_keepalive}
+                value: [0xAF, 0x01]

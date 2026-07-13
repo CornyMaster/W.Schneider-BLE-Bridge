@@ -1,0 +1,2 @@
+# BLE client library used by all scripts in this directory (Python 3.10+).
+bleak>=0.21

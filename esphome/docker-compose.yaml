@@ -1,0 +1,17 @@
+# =============================================================================
+# Optional: ESPHome dashboard for building, flashing and viewing logs.
+# Run `docker compose up -d` in this directory, then open http://localhost:6052
+# This is NOT needed at runtime — the ESP32 runs autonomously and Home Assistant
+# talks to it directly over the native API.
+# =============================================================================
+services:
+  esphome:
+    image: ghcr.io/esphome/esphome:latest
+    container_name: esphome
+    restart: unless-stopped
+    # Host networking lets the dashboard discover the node via mDNS and flash
+    # it over the air (best on Linux; on Docker Desktop use port mapping instead).
+    network_mode: host
+    volumes:
+      - ./:/config
+      - /etc/localtime:/etc/localtime:ro

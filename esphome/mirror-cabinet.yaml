@@ -1,0 +1,63 @@
+# =============================================================================
+# W.Schneider mirror cabinet -> Home Assistant BLE bridge — device configuration
+# Controller protocol lives in packages/wsc-lc10.yaml. See README.md for the
+# full step-by-step setup and docs/protocol.md for the protocol reference.
+# =============================================================================
+
+# --- User settings: fill in your cabinet's identifiers (see README) -----------
+substitutions:
+  name: mirror-cabinet
+  friendly_name: "Mirror Cabinet"
+  # ESP32 board id. Tested board: IoTorero (Athom) Mini Relay RS01C3, an
+  # ESP32-C3 (see docs/hardware.md). Change to match your own board.
+  board: esp32-c3-devkitm-1
+
+  # Your cabinet's BLE MAC address. Find it with: python scripts/wsc_ctl.py scan
+  cabinet_mac: "AA:BB:CC:DD:EE:FF"
+
+  # Your cabinet's vendor GATT service UUID, split around the 4th byte (the
+  # byte that selects each characteristic). Read the full UUID with
+  #   python scripts/discover_gatt.py
+  # A service UUID has the form  PPPPPPnn-ssss-ssss-ssss-ssssssssssss  where the
+  # 4th byte "nn" is the selector. Split YOUR UUID around it, for example a UUID
+  # "abcdefc0-1122-3344-5566-778899aabbcc" splits into:
+  #   uuid_prefix: "abcdef"                       (the 6 hex chars before "c0")
+  #   uuid_suffix: "-1122-3344-5566-778899aabbcc" (from the first hyphen onward)
+  uuid_prefix: "REPLACE"
+  uuid_suffix: "REPLACE"
+
+# --- Controller package (protocol implementation) ----------------------------
+packages:
+  controller: !include packages/wsc-lc10.yaml
+
+# --- Core ---------------------------------------------------------------------
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: ${board}
+  framework:
+    type: esp-idf
+
+logger:
+
+# --- Home Assistant API & OTA updates -----------------------------------------
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# --- Wi-Fi (power saving must stay off for stable BLE/Wi-Fi coexistence) ------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: "${name} setup"
+    password: !secret fallback_ap_password
+
+captive_portal:
