@@ -18,11 +18,13 @@ against a real cabinet; see [docs/protocol.md](docs/protocol.md).
 
 ## Features
 
-- A combined **Cabinet** light with on/off (both lamps), brightness (1–100 %)
-  and color temperature (2000–6500 K).
-- The two lamps (inner/mirror and outer/perimeter) also as separate on/off
-  switches for per-lamp control.
-- A connectivity sensor and a manual "pair / send init" button.
+- **Per-lamp on/off** for the two lamps (inner/mirror and outer/perimeter) as
+  two switches, plus **brightness** (1–100 %) and **color temperature**
+  (2000–6500 K) sliders that act on both lamps together.
+- **Real state read-back:** Home Assistant reflects the cabinet's actual state
+  (read over BLE) — including changes made with the cabinet's own buttons — with
+  a configurable re-read interval.
+- A connectivity sensor and a "read state now" button.
 - A built-in local web interface (every entity, a live log and an OTA
   firmware-upload form) served directly by the ESP32.
 - Runs autonomously on the ESP32; Home Assistant talks to it directly, no cloud
@@ -33,9 +35,10 @@ against a real cabinet; see [docs/protocol.md](docs/protocol.md).
 A Shelly or a passive BLE proxy is **not** enough: controlling the cabinet
 requires an *active* GATT client connection, which needs an ESP32 running
 ESPHome's `ble_client`. The ESP32 connects to the cabinet by MAC address (no
-pairing/bonding — the controller has no device-side access control), mirrors
-the Home Assistant entity state onto the device, and sends a periodic keepalive
-so the controller does not drop the link. Details: [docs/protocol.md](docs/protocol.md).
+pairing/bonding — the controller has no device-side access control), reads the
+cabinet's real state into Home Assistant, writes changes back when you operate an
+entity, and sends a periodic keepalive so the controller does not drop the link.
+Details: [docs/protocol.md](docs/protocol.md).
 
 ## Hardware
 
@@ -173,32 +176,36 @@ the entities to the cabinet's area.
 **First connection = the definitive pairing test:** if the light reacts without
 any button press on the cabinet, there is no device-side access control (as
 observed on the tested unit). If it does not, press any button on the cabinet
-while the ESP connects — the "pair / send init" button helps with the timing.
+while the ESP connects.
 
 ### 7. Verify
 
 - The **Cabinet connected** sensor is on and the ESPHome log shows a stable BLE
   link (no reconnect loop).
-- The **Cabinet** light switches both lamps and its brightness / color
-  temperature visibly affect the lit lamp(s); **Outer lamp** / **Inner lamp**
-  switch the respective lamp.
+- The **Outer lamp** / **Inner lamp** switches toggle the respective lamp;
+  **Brightness** / **Color temperature** visibly affect the lit lamp(s). The
+  **Actual …** diagnostic sensors reflect the real state read from the cabinet.
 - After a Home Assistant restart the entities return; after an ESP reconnect the
-  state is re-applied automatically.
+  actual state is re-read automatically.
 
 ## Entities
 
 | Entity | Type | Notes |
 |--------|------|-------|
-| Cabinet | `light` | on/off (both lamps) + brightness + color temperature |
 | Outer lamp | `switch` | perimeter lamp, per-lamp on/off |
 | Inner lamp | `switch` | mirror lamp, per-lamp on/off |
+| Brightness | `number` | 1–100 %, applies to both lamps |
+| Color temperature | `number` | 2000–6500 K, applies to both lamps |
+| BLE re-read interval | `number` | how often the actual state is re-read (0 = only on connect) |
 | Cabinet connected | `binary_sensor` | BLE link state |
-| Pair / send init | `button` | re-sends the init handshake |
+| Read state now | `button` | force an immediate re-read |
+| Actual brightness / color temperature / lamp mask | `sensor` | diagnostic read-back values |
 
-The **Cabinet** light is the main control; its on/off drives both lamps, and its
-brightness and color temperature apply to **both** lamps together (a hardware
-limitation). The two lamp switches remain for per-lamp on/off. See
-[docs/home-assistant.md](docs/home-assistant.md) for behaviour details.
+The two lamp switches give per-lamp on/off; brightness and color temperature
+apply to **both** lamps together (a hardware limitation) and only have a visible
+effect while at least one lamp is on. Home Assistant mirrors the cabinet's real
+state via the read-back sensors. See [docs/home-assistant.md](docs/home-assistant.md)
+for behaviour details.
 
 ## Supported models
 
@@ -211,9 +218,14 @@ one, follow [docs/adding-a-new-model.md](docs/adding-a-new-model.md).
 
 ## Limitations
 
-- **No reliable state feedback.** The controller does not report a trustworthy
-  state, so Home Assistant works *optimistically*. Changes made through the
-  vendor app are not reflected in Home Assistant.
+- **Read-back, but no push.** The device reads the real state on connect and
+  periodically, so Home Assistant reflects changes made with the cabinet's
+  buttons — but the controller does not *push* updates, so an external change
+  appears only at the next re-read (interval configurable, default 30 s).
+- **One BLE connection.** The cabinet accepts a single BLE connection; while
+  this bridge is connected, the vendor remote/app cannot reach it. The
+  connection is held persistently (a reliable on-demand model is not feasible on
+  single-core ESP32-C3 boards).
 - **Shared brightness/color.** The hardware cannot set brightness or color
   temperature per lamp.
 - **Night-light schedules and scenes** are out of scope.

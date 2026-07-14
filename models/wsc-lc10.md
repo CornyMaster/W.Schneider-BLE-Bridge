@@ -21,9 +21,9 @@ Two lamps, individually switchable:
 Bit assignment verified on the physical device. Brightness and color
 temperature apply to **both** lamps together (hardware limitation).
 
-In Home Assistant this is presented as one combined **Cabinet** `light` (on/off
-+ brightness + color temperature) plus the two lamp switches for per-lamp on/off
-— see [../docs/home-assistant.md](../docs/home-assistant.md).
+In Home Assistant this is presented as two lamp switches (per-lamp on/off) plus
+shared **Brightness** and **Color temperature** sliders, with the real state
+read back from the cabinet — see [../docs/home-assistant.md](../docs/home-assistant.md).
 
 ## Ranges
 

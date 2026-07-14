@@ -3,21 +3,30 @@
 # Include from a device configuration via `packages:`. The including file MUST
 # define these substitutions:  cabinet_mac, uuid_prefix, uuid_suffix.
 # Protocol reference: docs/protocol.md
+#
+# Connection model: PERSISTENT (auto_connect: true). The controller allows only
+# one BLE connection, so while this device is connected the vendor remote/app
+# cannot reach the cabinet. On single-core boards (ESP32-C3) an on-demand model
+# (auto_connect: false + manual connect) is unreliable in ESPHome, hence a held
+# connection. The cabinet's own touch buttons keep working (wired to the
+# controller); their changes are picked up by the periodic re-read below.
+#
+# State handling: nothing is written on connect. The device READS c2/c3/c6 and
+# mirrors the real cabinet state into Home Assistant (publish_state does not
+# trigger a write-back, so there is no feedback loop). Writes happen only on an
+# actual change (switch/slider). A configurable periodic re-read catches changes
+# made with the cabinet's buttons.
 # =============================================================================
 
 # --- GATT characteristic UUIDs (derived from the parent's uuid_prefix/suffix) --
-# Each characteristic UUID is the vendor service UUID with its 4th byte replaced
-# by the selector shown below (c2 = color temp, c3 = brightness, ...).
 substitutions:
   uuid_service:    "${uuid_prefix}c0${uuid_suffix}"
   uuid_color_temp: "${uuid_prefix}c2${uuid_suffix}"
   uuid_brightness: "${uuid_prefix}c3${uuid_suffix}"
-  uuid_rtc_date:   "${uuid_prefix}c4${uuid_suffix}"
-  uuid_rtc_time:   "${uuid_prefix}c5${uuid_suffix}"
   uuid_lamp_mask:  "${uuid_prefix}c6${uuid_suffix}"
   uuid_keepalive:  "${uuid_prefix}ce${uuid_suffix}"
 
-# --- BLE client connection to the cabinet --------------------------------------
+# --- BLE connection to the cabinet --------------------------------------------
 esp32_ble_tracker:
   scan_parameters:
     active: true
@@ -25,22 +34,23 @@ esp32_ble_tracker:
 ble_client:
   - mac_address: ${cabinet_mac}
     id: cabinet_ble
+    auto_connect: true
     on_connect:
       then:
         - lambda: 'id(cabinet_connected).publish_state(true);'
-        - delay: 2s
-        - script.execute: send_init
-        - script.execute: apply_state
+        # Do NOT write on connect. Wait for services to resolve, then read the
+        # real state and mirror it into Home Assistant.
+        - delay: 1200ms
+        - lambda: |-
+            id(last_read_ms) = millis();
+            id(actual_brightness).update();
+            id(actual_color_temp).update();
+            id(actual_mask).update();
     on_disconnect:
       then:
         - lambda: 'id(cabinet_connected).publish_state(false);'
 
-# --- Time source for the optional RTC sync handshake ---------------------------
-time:
-  - platform: homeassistant
-    id: ha_time
-
-# --- Persisted target state (survives reboots) ---------------------------------
+# --- Persisted target state (survives reboots) --------------------------------
 globals:
   - id: target_brightness_pct
     type: float
@@ -50,43 +60,28 @@ globals:
     type: int
     restore_value: yes
     initial_value: '4000'
+  - id: last_read_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
 
-# --- Write routines -------------------------------------------------------------
+# --- Write routine (on change) ------------------------------------------------
 script:
-  # Sync the controller's real-time clock (used only by its night-light
-  # scheduler). Skipped while Home Assistant has not provided a valid time.
-  - id: send_init
-    then:
-      - if:
-          condition:
-            lambda: 'return id(ha_time).now().is_valid();'
-          then:
-            - ble_client.ble_write:
-                id: cabinet_ble
-                service_uuid: ${uuid_service}
-                characteristic_uuid: ${uuid_rtc_date}
-                value: !lambda |-
-                  auto t = id(ha_time).now();
-                  return { (uint8_t)(t.year % 100), (uint8_t)t.month,
-                           (uint8_t)t.day_of_month };
-            - ble_client.ble_write:
-                id: cabinet_ble
-                service_uuid: ${uuid_service}
-                characteristic_uuid: ${uuid_rtc_time}
-                value: !lambda |-
-                  auto t = id(ha_time).now();
-                  return { (uint8_t)t.hour, (uint8_t)t.minute,
-                           (uint8_t)t.second };
-
-  # Push the desired state to the device: lamp mask first, then (only while
-  # at least one lamp is on) color temperature and brightness for both lamps.
+  # Push the desired state: lamp mask from both switches, then (only while at
+  # least one lamp is on) color temperature and brightness for both lamps.
+  # mode: restart -> if two changes arrive in quick succession (both switches,
+  # or dragging a slider) the LAST state wins; with the default (single) the
+  # second call would be dropped and the controller would miss the final state
+  # (e.g. "both off" would only write the first bit).
   - id: apply_state
+    mode: restart
     then:
       - ble_client.ble_write:
           id: cabinet_ble
           service_uuid: ${uuid_service}
           characteristic_uuid: ${uuid_lamp_mask}
           value: !lambda |-
+            // bit0 = outer, bit1 = inner. byte0 = 0x01 if any lamp is on.
             uint8_t mask = (id(lamp_outer).state ? 0x01 : 0x00)
                          | (id(lamp_inner).state ? 0x02 : 0x00);
             return { (uint8_t)(mask ? 0x01 : 0x00), 0x00, mask, 0x00 };
@@ -110,12 +105,12 @@ script:
                 characteristic_uuid: ${uuid_brightness}
                 value: !lambda |-
                   int raw = (int)(id(target_brightness_pct) * 100.0f + 0.5f);
-                  if (raw < 100)   raw = 100;
+                  if (raw < 100)   raw = 100;   // never 0 while a lamp is on
                   if (raw > 10000) raw = 10000;
                   return { (uint8_t)(raw >> 8), (uint8_t)(raw & 0xFF),
                            (uint8_t)(raw >> 8), (uint8_t)(raw & 0xFF) };
 
-# --- Entities exposed to Home Assistant ------------------------------------------
+# --- Entities exposed to Home Assistant ---------------------------------------
 binary_sensor:
   - platform: template
     name: "Cabinet connected"
@@ -123,20 +118,31 @@ binary_sensor:
     device_class: connectivity
 
 button:
+  # Force an immediate re-read of the actual state (outside the periodic cycle).
   - platform: template
-    name: "Pair / send init"
-    id: cabinet_pair
+    name: "Read state now"
+    id: read_state_now
     entity_category: config
     on_press:
-      - script.execute: send_init
-      - script.execute: apply_state
+      - if:
+          condition:
+            lambda: 'return id(cabinet_connected).state;'
+          then:
+            - lambda: |-
+                id(last_read_ms) = millis();
+                id(actual_brightness).update();
+                id(actual_color_temp).update();
+                id(actual_mask).update();
 
 switch:
+  # Two individually switchable lamps; brightness/color act on both together.
+  # restore_mode: DISABLED -> no write attempt on boot; the state comes purely
+  # from reading the cabinet.
   - platform: template
     name: "Outer lamp"
     id: lamp_outer
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
+    restore_mode: DISABLED
     turn_on_action:
       - lambda: |-
           if (id(target_brightness_pct) <= 0) id(target_brightness_pct) = 80;
@@ -150,7 +156,7 @@ switch:
     name: "Inner lamp"
     id: lamp_inner
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
+    restore_mode: DISABLED
     turn_on_action:
       - lambda: |-
           if (id(target_brightness_pct) <= 0) id(target_brightness_pct) = 80;
@@ -160,56 +166,132 @@ switch:
       - lambda: 'id(lamp_inner).publish_state(false);'
       - script.execute: apply_state
 
-# --- Combined light (on/off + brightness + color temperature) --------------------
-# Presented to Home Assistant as one "Cabinet" light. The two template outputs
-# below are invisible in HA; their write_action stores the requested values into
-# the shared globals. gamma_correct is disabled so brightness maps linearly to
-# percent. Brightness and color temperature act on both lamps (hardware limit).
-output:
+number:
   - platform: template
-    id: out_brightness
-    type: float
-    write_action:
-      - lambda: |-
-          // state is 0..1; keep the last non-zero level so turning the light off
-          // does not wipe the remembered brightness.
-          if (state > 0.0f) id(target_brightness_pct) = state * 100.0f;
-
-  - platform: template
-    id: out_color_temp
-    type: float
-    write_action:
-      - lambda: |-
-          // state is 0..1 on the mired scale (0 = cold 6500 K, 1 = warm 2000 K).
-          float min_mired = 1000000.0f / 6500.0f;
-          float max_mired = 1000000.0f / 2000.0f;
-          float mired = min_mired + state * (max_mired - min_mired);
-          id(target_color_temp_k) = (int)(1000000.0f / mired + 0.5f);
-
-light:
-  - platform: color_temperature
-    name: "Cabinet"
-    id: cabinet_light
-    brightness: out_brightness
-    color_temperature: out_color_temp
-    cold_white_color_temperature: 6500 K
-    warm_white_color_temperature: 2000 K
-    gamma_correct: 1.0
-    restore_mode: RESTORE_DEFAULT_OFF
-    # On/off is a master for the whole cabinet: it fans out to both lamp switches
-    # (which own the mask). Per-lamp on/off stays on those switches.
-    on_turn_on:
-      - switch.turn_on: lamp_outer
-      - switch.turn_on: lamp_inner
-    on_turn_off:
-      - switch.turn_off: lamp_outer
-      - switch.turn_off: lamp_inner
-    # Re-apply on any change, so brightness/color edits (light already on) are sent.
-    on_state:
+    name: "Brightness"
+    id: brightness
+    unit_of_measurement: "%"
+    min_value: 1          # the vendor app minimum is 10 %
+    max_value: 100
+    step: 1
+    mode: slider
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: 'id(target_brightness_pct) = x;'
       - script.execute: apply_state
 
-# --- Keepalive (the controller drops idle connections after ~18 s) ---------------
+  - platform: template
+    name: "Color temperature"
+    id: color_temp
+    unit_of_measurement: "K"
+    min_value: 2000
+    max_value: 6500
+    step: 100
+    mode: slider
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: 'id(target_color_temp_k) = (int) x;'
+      - script.execute: apply_state
+
+  # How often the actual state is re-read (catches changes made with the
+  # cabinet's own buttons). 0 = only on connect; N = additionally every N
+  # seconds. Adjustable in Home Assistant, survives reboots (restore_value).
+  - platform: template
+    name: "BLE re-read interval"
+    id: reread_interval
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 3600
+    step: 5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+
+# --- State read-back ----------------------------------------------------------
+# These ble_client sensors read c2/c3/c6 and mirror the real cabinet state into
+# Home Assistant via publish_state (which does not trigger a write). Reads are
+# driven explicitly via .update() (on connect / periodic / button), so the
+# update_interval is set very high to keep the auto-poll out of the way.
+sensor:
+  - platform: ble_client
+    ble_client_id: cabinet_ble
+    type: characteristic
+    id: actual_brightness
+    name: "Actual brightness"
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    service_uuid: ${uuid_service}
+    characteristic_uuid: ${uuid_brightness}
+    update_interval: 86400s
+    lambda: |-
+      if (x.size() < 2) return {};
+      int raw = (x[0] << 8) | x[1];        // first uint16 (BE) = actual value
+      float pct = raw / 100.0f;
+      if (pct < 0) pct = 0;
+      if (pct > 100) pct = 100;
+      id(target_brightness_pct) = pct;
+      id(brightness).publish_state(pct);
+      return pct;
+
+  - platform: ble_client
+    ble_client_id: cabinet_ble
+    type: characteristic
+    id: actual_color_temp
+    name: "Actual color temperature"
+    entity_category: diagnostic
+    unit_of_measurement: "K"
+    accuracy_decimals: 0
+    service_uuid: ${uuid_service}
+    characteristic_uuid: ${uuid_color_temp}
+    update_interval: 86400s
+    lambda: |-
+      if (x.size() < 2) return {};
+      int k = (x[0] << 8) | x[1];
+      if (k < 2000 || k > 6500) return {};
+      id(target_color_temp_k) = k;
+      id(color_temp).publish_state((float) k);
+      return (float) k;
+
+  - platform: ble_client
+    ble_client_id: cabinet_ble
+    type: characteristic
+    id: actual_mask
+    name: "Actual lamp mask"
+    entity_category: diagnostic
+    service_uuid: ${uuid_service}
+    characteristic_uuid: ${uuid_lamp_mask}
+    update_interval: 86400s
+    lambda: |-
+      if (x.size() < 3) return {};
+      uint8_t mask = x[2];                 // MM 00 ZZ 00 -> ZZ = lamp bits
+      id(lamp_outer).publish_state((mask & 0x01) != 0);
+      id(lamp_inner).publish_state((mask & 0x02) != 0);
+      return (float) mask;
+
+# --- Periodic re-read + keepalive ---------------------------------------------
 interval:
+  # Periodic re-read (only when N > 0 and connected).
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              int n = (int) id(reread_interval).state;
+              return id(cabinet_connected).state && n > 0
+                     && (millis() - id(last_read_ms) >= (uint32_t)(n * 1000));
+          then:
+            - lambda: |-
+                id(last_read_ms) = millis();
+                id(actual_brightness).update();
+                id(actual_color_temp).update();
+                id(actual_mask).update();
+
+  # Keepalive: the controller drops idle connections after ~18 s.
   - interval: 3s
     then:
       - if:
