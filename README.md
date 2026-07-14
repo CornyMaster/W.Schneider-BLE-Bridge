@@ -23,6 +23,8 @@ against a real cabinet; see [docs/protocol.md](docs/protocol.md).
 - The two lamps (inner/mirror and outer/perimeter) also as separate on/off
   switches for per-lamp control.
 - A connectivity sensor and a manual "pair / send init" button.
+- A built-in local web interface (every entity, a live log and an OTA
+  firmware-upload form) served directly by the ESP32.
 - Runs autonomously on the ESP32; Home Assistant talks to it directly, no cloud
   and no vendor app involved.
 

@@ -42,6 +42,15 @@ esp32:
 
 logger:
 
+# --- Local web interface (all entities + log + firmware upload) ----------------
+# Serves a browser UI on port 80 that exposes every entity with controls, a
+# live log and an OTA firmware-upload form. Assets are embedded (local: true) so
+# it works without internet access. This costs extra RAM/CPU on single-core
+# boards such as the ESP32-C3; remove this block if it affects BLE stability.
+web_server:
+  version: 2
+  local: true
+
 # --- Home Assistant API & OTA updates -----------------------------------------
 api:
   encryption:
@@ -50,6 +59,8 @@ api:
 ota:
   - platform: esphome
     password: !secret ota_password
+  # Enables the browser-based firmware upload offered by web_server above.
+  - platform: web_server
 
 # --- Wi-Fi (power saving must stay off for stable BLE/Wi-Fi coexistence) ------
 wifi:
